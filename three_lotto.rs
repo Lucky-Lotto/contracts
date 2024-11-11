@@ -3,9 +3,8 @@ use anchor_lang::solana_program::hash::hash;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use solana_program::clock::Clock;
 
-declare_id!("3jpDxNvXP2UDcySyNWehurp9fECx3awJUrk5aRc6bBkk");
+declare_id!("4Vi9n94NDfjgd4d4ETVKKfsPYym1ugenokxNt6TtyGth");
 
-// Constant definition optimization
 pub const SECONDS_PER_MINUTE: i64 = 60;
 pub const MINUTES_PER_HOUR: i64 = 60;
 pub const DRAW_WINDOW_MINUTES: i64 = 5; // Lottery window (minutes)
@@ -52,39 +51,33 @@ pub mod lottery_3d_contract {
         let current_timestamp = clock.unix_timestamp;
         let lottery = &mut ctx.accounts.lottery;
 
-        // Verification time window
         require!(
             !lottery.is_in_draw_window(current_timestamp),
             LotteryError::DrawWindowActive
         );
 
-        // 验证token mint
         require!(
             ctx.accounts.lottery_token_account.mint == lottery.token_mint
                 && ctx.accounts.buyer_token_account.mint == lottery.token_mint,
             LotteryError::InvalidTokenMint
         );
 
-        // Verify lock status
         if lottery.is_locked {
             let time_since_last_draw = current_timestamp - lottery.last_draw_time;
             require!(time_since_last_draw > LOCK_DURATION, LotteryError::Locked);
             lottery.is_locked = false;
         }
 
-        // Verify bet amount
         require!(
             amount >= lottery.min_purchase_amount as u64,
             LotteryError::InsufficientAmount
         );
 
-        // Verify ticket number
         require!(
             validate_ticket_numbers(&numbers),
             LotteryError::InvalidTicketNumbers
         );
 
-        // Execute transfer
         let transfer_ctx = CpiContext::new(
             ctx.accounts.token_program.to_account_info(),
             Transfer {
@@ -110,13 +103,11 @@ pub mod lottery_3d_contract {
         let current_timestamp = clock.unix_timestamp;
         let lottery = &mut ctx.accounts.lottery;
 
-        // Verify lottery draw time
         require!(
             lottery.is_in_draw_window(current_timestamp),
             LotteryError::InvalidDrawTime
         );
 
-        // Verify lottery draw interval
         require!(
             lottery.can_draw(current_timestamp),
             LotteryError::DrawTooEarly
@@ -124,7 +115,6 @@ pub mod lottery_3d_contract {
 
         require!(!lottery.is_locked, LotteryError::AlreadyDrawn);
 
-        // Generate random numbers
         let recent_blockhashes = ctx.accounts.recent_blockhashes.try_borrow_data()?;
         let random_value = generate_vrf_random_number(
             current_timestamp,
@@ -135,7 +125,6 @@ pub mod lottery_3d_contract {
 
         let draw_numbers = convert_random_to_3d_numbers(&random_value);
 
-        // update status
         lottery.last_draw_time = current_timestamp;
         lottery.is_locked = true;
         lottery.last_draw_numbers = draw_numbers;
@@ -160,7 +149,7 @@ pub mod lottery_3d_contract {
 
         require!(prize_amount > 0, LotteryError::InvalidPrizeAmount);
 
-        lottery.last_prize_amount = prize_amount;
+        lottery.last_prize_amount += prize_amount;
 
         emit!(PrizeAmountUpdated {
             amount: prize_amount,
@@ -207,9 +196,7 @@ pub mod lottery_3d_contract {
         ctx: Context<'_, '_, '_, 'info, TransferToken<'info>>,
         transfers: Vec<TransferInfo>,
         total_amount: u64,
-        decimals: u8,
     ) -> Result<()> {
-        // 1. Verify prize pool amount
         require!(total_amount > 0, LotteryError::InsufficientPrizeAmount);
         require!(
             ctx.accounts.lottery.last_prize_amount >= total_amount,
@@ -217,7 +204,6 @@ pub mod lottery_3d_contract {
         );
 
         let auth_key = ctx.accounts.authority.key();
-        let lottery_seeds: &[&[u8]] = &[b"lottery", auth_key.as_ref(), &[ctx.bumps.lottery]];
 
         for (i, transfer) in transfers.iter().enumerate() {
             let recipient_account = ctx
@@ -225,28 +211,20 @@ pub mod lottery_3d_contract {
                 .get(i)
                 .ok_or(LotteryError::InvalidTokenMint)?;
 
-            // Construct transfer instructions using the standard method of spl_token
-            let ix = spl_token::instruction::transfer_checked(
-                &ctx.accounts.token_program.key(),
-                &ctx.accounts.lottery_token_account.key(),
-                &ctx.accounts.mint.key(),
-                &recipient_account.key(),
-                &ctx.accounts.lottery.key(),
-                &[],
-                transfer.amount,
-                decimals,
-            )?;
+            let signer_seeds: &[&[&[u8]]] =
+                &[&[b"lottery", auth_key.as_ref(), &[ctx.bumps.lottery]]];
 
-            solana_program::program::invoke_signed(
-                &ix,
-                &[
-                    ctx.accounts.lottery_token_account.to_account_info(),
-                    ctx.accounts.mint.to_account_info(),
-                    recipient_account.to_account_info(),
-                    ctx.accounts.lottery.to_account_info(),
+            token::transfer(
+                CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
-                ],
-                &[lottery_seeds],
+                    token::Transfer {
+                        from: ctx.accounts.lottery_token_account.to_account_info(),
+                        to: recipient_account.to_account_info(),
+                        authority: ctx.accounts.lottery.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                transfer.amount,
             )?;
 
             emit!(TokenDrawTransfer {
@@ -256,7 +234,6 @@ pub mod lottery_3d_contract {
             });
         }
 
-        // update status
         let lottery = &mut ctx.accounts.lottery;
         lottery.last_prize_amount = lottery
             .last_prize_amount
@@ -304,9 +281,9 @@ pub struct Initialize<'info> {
         seeds = [b"token_account", authority.key().as_ref()],
         bump,
         token::mint = token_mint,
-        token::authority = lottery,
+        token::authority = lottery
     )]
-    pub token_account: Account<'info, TokenAccount>,
+    pub token_account: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Token mint account
     pub token_mint: AccountInfo<'info>,
@@ -521,8 +498,6 @@ fn generate_vrf_random_number(
     uuid: &str,
 ) -> Result<[u8; 32]> {
     let mut data = Vec::with_capacity(512);
-
-    //Combine random source data
     data.extend_from_slice(uuid.as_bytes());
     data.extend_from_slice(&timestamp.to_le_bytes());
     data.extend_from_slice(recent_blockhashes);
@@ -533,7 +508,6 @@ fn generate_vrf_random_number(
         data.extend_from_slice(&clock.slot.to_le_bytes());
     }
 
-    //Multiple hashes to increase randomness
     let mut final_hash = hash(&data).to_bytes();
     for _ in 0..3 {
         final_hash = hash(&final_hash).to_bytes();

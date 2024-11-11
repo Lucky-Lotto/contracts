@@ -3,9 +3,8 @@ use anchor_lang::solana_program::hash::hash;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use solana_program::clock::Clock;
 
-declare_id!("5VKCTWtB3PhqPEFMFZ4TWPFYQv1kEfoEdr1smv2XHMp3");
+declare_id!("4hHb7msxJiSY52LToCS1vvQd4friFRQkKyuK74HhNPgv");
 
-//constant definition
 pub const LOCK_DURATION: i64 = 600; // 10 minutes lock period
 pub const DRAW_START_TIME: i64 = 0; // UTC 00:00:00
 pub const DRAW_END_TIME: i64 = 600; // UTC 00:10:00
@@ -81,17 +80,16 @@ pub mod lottery_contract {
     pub fn draw(ctx: Context<Draw>, uuid: String) -> Result<()> {
         let clock = Clock::get()?;
         let current_timestamp = clock.unix_timestamp;
-        let day_seconds = current_timestamp % 86400;
+        let day_start = (current_timestamp / 86400) * 86400;
+        let seconds_from_day_start = current_timestamp - day_start;
 
-        // Check whether it is within the lottery time window (UTC 00:00:00 -00:10:00)
         require!(
-            day_seconds >= DRAW_START_TIME && day_seconds <= DRAW_END_TIME,
+            seconds_from_day_start >= DRAW_START_TIME && seconds_from_day_start <= DRAW_END_TIME,
             CustomError::InvalidDrawTime
         );
 
         let lottery = &mut ctx.accounts.lottery;
 
-        // Check if a prize has been drawn
         require!(!lottery.is_locked, CustomError::AlreadyDrawn);
 
         let recent_blockhashes = ctx.accounts.recent_blockhashes.try_borrow_data()?;
@@ -117,20 +115,18 @@ pub mod lottery_contract {
         Ok(())
     }
 
-    // Added method to update bonus amount
     pub fn update_prize_amount(ctx: Context<UpdatePrize>, prize_amount: u64) -> Result<()> {
         let lottery = &mut ctx.accounts.lottery;
         let clock = Clock::get()?;
         let current_timestamp = clock.unix_timestamp;
 
-        // Check if it is within 10 minutes after the draw
         require!(
             lottery.is_locked && current_timestamp - lottery.last_draw_time <= LOCK_DURATION,
             CustomError::PrizeUpdateWindowClosed
         );
         require!(prize_amount > 0, CustomError::InvalidPrizeAmount);
 
-        lottery.last_prize_amount = prize_amount;
+        lottery.last_prize_amount += prize_amount;
 
         emit!(PrizeAmountUpdated {
             amount: prize_amount,
@@ -169,10 +165,8 @@ pub mod lottery_contract {
     pub fn transfer_token<'info>(
         ctx: Context<'_, '_, '_, 'info, TransferToken<'info>>,
         transfers: Vec<TransferInfo>,
-        total_amount: u64,
-        decimals: u8,
+        total_amount: u64
     ) -> Result<()> {
-        // 1. Validate prize pool amount
         require!(total_amount > 0, CustomError::InsufficientPrizeAmount);
         require!(
             ctx.accounts.lottery.last_prize_amount >= total_amount,
@@ -180,56 +174,41 @@ pub mod lottery_contract {
         );
 
         let auth_key = ctx.accounts.authority.key();
-        let lottery_seeds: &[&[u8]] = &[b"lottery", auth_key.as_ref(), &[ctx.bumps.lottery]];
-
-        // 2. Process each transfer individually
         for (i, transfer) in transfers.iter().enumerate() {
             let recipient_account = ctx
                 .remaining_accounts
                 .get(i)
                 .ok_or(CustomError::InvalidTokenMint)?;
 
-            // Construct transfer instruction using spl_token standard approach
-            let ix = spl_token::instruction::transfer_checked(
-                &ctx.accounts.token_program.key(),
-                &ctx.accounts.lottery_token_account.key(),
-                &ctx.accounts.mint.key(),
-                &recipient_account.key(),
-                &ctx.accounts.lottery.key(),
-                &[],
-                transfer.amount,
-                decimals,
-            )?;
+            let signer_seeds: &[&[&[u8]]] =
+                &[&[b"lottery", auth_key.as_ref(), &[ctx.bumps.lottery]]];
 
-            // Execute the transfer with PDA signing
-            solana_program::program::invoke_signed(
-                &ix,
-                &[
-                    ctx.accounts.lottery_token_account.to_account_info(),
-                    ctx.accounts.mint.to_account_info(),
-                    recipient_account.to_account_info(),
-                    ctx.accounts.lottery.to_account_info(),
+            token::transfer(
+                CpiContext::new_with_signer(
                     ctx.accounts.token_program.to_account_info(),
-                ],
-                &[lottery_seeds],
+                    token::Transfer {
+                        from: ctx.accounts.lottery_token_account.to_account_info(),
+                        to: recipient_account.to_account_info(),
+                        authority: ctx.accounts.lottery.to_account_info(),
+                    },
+                    signer_seeds,
+                ),
+                transfer.amount,
             )?;
 
-            // Emit transfer event
             emit!(TokenDrawTransfer {
                 amount: transfer.amount,
                 recipient: transfer.recipient,
                 remaining_prize: ctx.accounts.lottery.last_prize_amount - transfer.amount,
             });
         }
-
-        // 3. Update lottery state
+        
         let lottery = &mut ctx.accounts.lottery;
         lottery.last_prize_amount = lottery
             .last_prize_amount
             .checked_sub(total_amount)
             .ok_or(CustomError::ArithmeticError)?;
 
-        // 4. Emit batch completion event
         emit!(BatchTransferCompleted {
             total_amount,
             transfer_count: transfers.len() as u8,
@@ -248,7 +227,7 @@ pub struct LotteryState {
     pub token_mint: Pubkey,
     pub last_draw_time: i64,
     pub is_locked: bool,
-    pub min_purchase_amount: u32, 
+    pub min_purchase_amount: u32,
     pub last_draw_numbers: [u8; 7],
     pub last_prize_amount: u64,
 }
@@ -284,7 +263,7 @@ pub struct Initialize<'info> {
         token::mint = token_mint,
         token::authority = lottery,
     )]
-    pub token_account: Account<'info, TokenAccount>,
+    pub token_account: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Token mint account
     pub token_mint: AccountInfo<'info>,
@@ -384,7 +363,6 @@ pub struct TransferInfo {
     pub amount: u64,
 }
 
-// Events
 #[event]
 pub struct TicketPurchased {
     pub buyer: Pubkey,
@@ -451,18 +429,14 @@ pub enum CustomError {
     InvalidTransferCount,
 }
 
-// Helper functions
 fn validate_ticket_numbers(numbers: &[u8; 7]) -> bool {
     let mut used_reds = std::collections::HashSet::new();
 
-    // Verify the first 6 red balls
     for &num in numbers.iter().take(6) {
         if num < 1 || num > 33 || !used_reds.insert(num) {
             return false;
         }
     }
-
-    // Verify blue ball
     numbers[6] >= 1 && numbers[6] <= 16
 }
 
@@ -495,7 +469,6 @@ fn convert_random_to_numbers(random_value: &[u8; 32]) -> [u8; 7] {
     let mut numbers = [0u8; 7];
     let mut used_reds = std::collections::HashSet::new();
 
-    // Generate 6 red balls (1 33)
     for i in 0..6 {
         let mut val = (random_value[i] as u16 % 33 + 1) as u8;
         while used_reds.contains(&val) {
@@ -505,7 +478,6 @@ fn convert_random_to_numbers(random_value: &[u8; 32]) -> [u8; 7] {
         numbers[i] = val;
     }
 
-    // Generate 1 blue ball (1 16)
     numbers[6] = (random_value[6] % 16 + 1) as u8;
 
     numbers
